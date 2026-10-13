@@ -14,18 +14,14 @@ LINE_Y_RATIO = 0.60
 DISPLAY_WIDTH = 960
 DISPLAY_HEIGHT = 540
 PLAYBACK_DELAY = 30
+MOVEMENT_THRESHOLD = 8
 
-# Check video file
 if not VIDEO_PATH.exists():
     raise FileNotFoundError(
-        f"Video not found: {VIDEO_PATH}. "
-        "Check the filename inside the videos folder."
+        f"Video not found: {VIDEO_PATH}"
     )
 
-# Load pretrained YOLO model
 model = YOLO(MODEL_NAME)
-
-# Open video
 cap = cv2.VideoCapture(str(VIDEO_PATH))
 
 if not cap.isOpened():
@@ -33,6 +29,8 @@ if not cap.isOpened():
 
 entered_ids = set()
 exited_ids = set()
+
+# Store the previous (x, y) position of each tracked ID
 previous_positions = {}
 
 print("Starting Intelligent Video Analytics...")
@@ -46,7 +44,6 @@ while True:
     height, width = frame.shape[:2]
     line_y = int(height * LINE_Y_RATIO)
 
-    # Detect and track people
     results = model.track(
         frame,
         persist=True,
@@ -56,7 +53,7 @@ while True:
         verbose=False
     )
 
-    # Draw the virtual counting line
+    # Draw the counting line
     cv2.line(
         frame,
         (0, line_y),
@@ -69,20 +66,40 @@ while True:
         boxes = results[0].boxes
 
         if boxes.id is not None:
-            xyxy = boxes.xyxy.cpu().numpy()
+            coordinates = boxes.xyxy.cpu().numpy()
             track_ids = boxes.id.int().cpu().tolist()
 
-            for box, track_id in zip(xyxy, track_ids):
+            for box, track_id in zip(coordinates, track_ids):
                 x1, y1, x2, y2 = map(int, box)
 
-                # Center of the detected person
+                # Calculate the person's center
                 center_x = (x1 + x2) // 2
                 center_y = (y1 + y2) // 2
 
-                previous_y = previous_positions.get(track_id)
+                previous_position = previous_positions.get(track_id)
+                direction = "Initializing"
 
-                # Detect line crossings
-                if previous_y is not None:
+                if previous_position is not None:
+                    previous_x, previous_y = previous_position
+
+                    dx = center_x - previous_x
+                    dy = center_y - previous_y
+
+                    # Classify the dominant movement direction
+                    if max(abs(dx), abs(dy)) < MOVEMENT_THRESHOLD:
+                        direction = "Stationary"
+                    elif abs(dx) >= abs(dy):
+                        direction = (
+                            "Moving Right" if dx > 0
+                            else "Moving Left"
+                        )
+                    else:
+                        direction = (
+                            "Moving Down" if dy > 0
+                            else "Moving Up"
+                        )
+
+                    # Count crossings of the horizontal line
                     crossed_down = (
                         previous_y < line_y <= center_y
                     )
@@ -102,9 +119,11 @@ while True:
                     ):
                         exited_ids.add(track_id)
 
-                previous_positions[track_id] = center_y
+                previous_positions[track_id] = (
+                    center_x, center_y
+                )
 
-                # Draw bounding box
+                # Draw bounding box and center
                 cv2.rectangle(
                     frame,
                     (x1, y1),
@@ -113,52 +132,61 @@ while True:
                     3
                 )
 
-                # Draw center point
                 cv2.circle(
                     frame,
                     (center_x, center_y),
-                    6,
+                    5,
                     (0, 0, 255),
                     -1
                 )
 
-                # Draw larger Person ID label
+                # Display person ID
                 cv2.putText(
                     frame,
                     f"Person ID: {track_id}",
-                    (x1, max(y1 - 15, 35)),
+                    (x1, max(y1 - 40, 30)),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0,
+                    0.8,
                     (0, 255, 0),
-                    3,
+                    2,
                     cv2.LINE_AA
                 )
 
-    # Draw larger Entered counter
+                # Display movement direction
+                cv2.putText(
+                    frame,
+                    direction,
+                    (x1, max(y1 - 10, 55)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 0),
+                    2,
+                    cv2.LINE_AA
+                )
+
+    # Display counters
     cv2.putText(
         frame,
         f"Entered: {len(entered_ids)}",
         (20, 50),
         cv2.FONT_HERSHEY_SIMPLEX,
-        1.4,
+        1.2,
         (0, 255, 0),
         3,
         cv2.LINE_AA
     )
 
-    # Draw larger Exited counter
     cv2.putText(
         frame,
         f"Exited: {len(exited_ids)}",
-        (20, 105),
+        (20, 100),
         cv2.FONT_HERSHEY_SIMPLEX,
-        1.4,
+        1.2,
         (0, 0, 255),
         3,
         cv2.LINE_AA
     )
 
-    # Resize only the displayed frame
     display_frame = cv2.resize(
         frame,
         (DISPLAY_WIDTH, DISPLAY_HEIGHT)
@@ -169,14 +197,13 @@ while True:
         display_frame
     )
 
-    # Press Q to quit
     if cv2.waitKey(PLAYBACK_DELAY) & 0xFF == ord("q"):
         break
 
-# Release resources
 cap.release()
 cv2.destroyAllWindows()
 
 print("\nVideo processing finished.")
 print("Total entered:", len(entered_ids))
 print("Total exited:", len(exited_ids))
+
