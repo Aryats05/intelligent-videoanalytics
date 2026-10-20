@@ -8,3 +8,4 @@ venv/
 runs/
 *.pt
 videos/*.mp4
+logs/

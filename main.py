@@ -1,5 +1,7 @@
 
 from pathlib import Path
+import csv
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -16,8 +18,8 @@ CONFIDENCE = 0.3
 LINE_Y_RATIO = 0.60
 SAFETY_MARGIN = 15
 
-# Restricted zone coordinates (normalized from 0.0 to 1.0)
-# Adjust these points to match your actual video.
+# Restricted zone: normalized coordinates (0.0 to 1.0)
+# Adjust these points to match your video.
 ZONE_POINTS = [
     (0.58, 0.20),
     (0.92, 0.20),
@@ -31,18 +33,75 @@ DISPLAY_HEIGHT = 540
 PLAYBACK_DELAY = 30
 MOVEMENT_THRESHOLD = 8
 
+# CSV event log
+LOG_PATH = Path("logs/intrusion_events.csv")
+
+# ---------------- HELPER FUNCTIONS ----------------
+
+def format_video_timestamp(milliseconds):
+    """Convert video position from milliseconds to HH:MM:SS.mmm."""
+    total_ms = max(0, int(milliseconds))
+    hours = total_ms // 3_600_000
+    minutes = (total_ms % 3_600_000) // 60_000
+    seconds = (total_ms % 60_000) // 1_000
+    millis = total_ms % 1_000
+
+    return f"{hours:02}:{minutes:02}:{seconds:02}.{millis:03}"
+
+
+def log_event(writer, person_id, event_type, video_timestamp):
+    """Write one intrusion event to the CSV log."""
+    recorded_at = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+
+    writer.writerow([
+        recorded_at,
+        video_timestamp,
+        person_id,
+        event_type,
+    ])
+
+    print(
+        f"{event_type}: Person ID {person_id} "
+        f"at video time {video_timestamp}"
+    )
+
+
 # ---------------- INITIALIZATION ----------------
 
 if not VIDEO_PATH.exists():
     raise FileNotFoundError(f"Video not found: {VIDEO_PATH}")
 
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# Append events so previous runs remain in the log.
+log_file = LOG_PATH.open(
+    "a",
+    newline="",
+    encoding="utf-8",
+)
+
+csv_writer = csv.writer(log_file)
+
+# Write the header only for a new or empty file.
+if log_file.tell() == 0:
+    csv_writer.writerow([
+        "recorded_at",
+        "video_timestamp",
+        "person_id",
+        "event_type",
+    ])
+    log_file.flush()
+
 model = YOLO(MODEL_NAME)
 cap = cv2.VideoCapture(str(VIDEO_PATH))
 
 if not cap.isOpened():
+    log_file.close()
     raise RuntimeError("Could not open the video.")
 
-# Previous center positions for movement analysis
+# Previous person center positions
 previous_positions = {}
 
 # Previous stable sides of the counting line
@@ -51,18 +110,19 @@ last_sides = {}
 # Previous restricted-zone state for each tracking ID
 previous_zone_states = {}
 
-# Line-crossing totals
+# Counts for the line
 entered_count = 0
 exited_count = 0
 
-# Restricted-zone event totals
+# Counts for restricted-zone transitions
 zone_entry_events = 0
 zone_exit_events = 0
 
-# Unique tracking IDs that have triggered an intrusion alert
+# Unique tracking IDs that entered the restricted zone
 intrusion_ids_seen = set()
 
 print("Starting Intelligent Video Analytics...")
+print(f"CSV event log: {LOG_PATH}")
 
 # ---------------- VIDEO PROCESSING ----------------
 
@@ -76,7 +136,12 @@ try:
         height, width = frame.shape[:2]
         line_y = int(height * LINE_Y_RATIO)
 
-        # Convert normalized polygon points into pixel coordinates
+        # Get the video's current playback timestamp
+        video_timestamp = format_video_timestamp(
+            cap.get(cv2.CAP_PROP_POS_MSEC)
+        )
+
+        # Convert normalized polygon coordinates to pixels
         zone = np.array(
             [
                 (int(x * width), int(y * height))
@@ -85,7 +150,8 @@ try:
             dtype=np.int32,
         )
 
-        # Detect and track people
+        # -------- DETECTION AND TRACKING --------
+
         results = model.track(
             frame,
             persist=True,
@@ -119,13 +185,13 @@ try:
             3,
         )
 
-        zone_label_x = max(10, int(zone[0][0]))
-        zone_label_y = max(30, int(zone[0][1]) - 10)
-
         cv2.putText(
             frame,
             "RESTRICTED ZONE",
-            (zone_label_x, zone_label_y),
+            (
+                max(10, int(zone[0][0])),
+                max(30, int(zone[0][1]) - 10),
+            ),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
             (0, 0, 255),
@@ -159,7 +225,7 @@ try:
             1,
         )
 
-        # IDs inside the zone in the current frame
+        # People currently inside the zone
         active_zone_ids = set()
 
         # -------- PROCESS TRACKED PEOPLE --------
@@ -183,7 +249,10 @@ try:
 
                     # -------- MOVEMENT DIRECTION --------
 
-                    previous_position = previous_positions.get(track_id)
+                    previous_position = previous_positions.get(
+                        track_id
+                    )
+
                     direction = "Initializing"
 
                     if previous_position is not None:
@@ -192,7 +261,10 @@ try:
                         dx = center_x - previous_x
                         dy = center_y - previous_y
 
-                        if max(abs(dx), abs(dy)) < MOVEMENT_THRESHOLD:
+                        if (
+                            max(abs(dx), abs(dy))
+                            < MOVEMENT_THRESHOLD
+                        ):
                             direction = "Stationary"
 
                         elif abs(dx) >= abs(dy):
@@ -224,24 +296,33 @@ try:
                         track_id, False
                     )
 
-                    # Person has entered the zone
+                    # ENTRY EVENT
                     if inside_zone and not was_inside:
                         zone_entry_events += 1
                         intrusion_ids_seen.add(track_id)
 
-                        print(
-                            f"INTRUSION ENTRY: Person ID {track_id} "
-                            "entered the restricted zone!"
+                        log_event(
+                            csv_writer,
+                            track_id,
+                            "ENTRY",
+                            video_timestamp,
                         )
 
-                    # Person has exited the zone
+                        # Persist each event immediately
+                        log_file.flush()
+
+                    # EXIT EVENT
                     elif was_inside and not inside_zone:
                         zone_exit_events += 1
 
-                        print(
-                            f"ZONE EXIT: Person ID {track_id} "
-                            "left the restricted zone."
+                        log_event(
+                            csv_writer,
+                            track_id,
+                            "EXIT",
+                            video_timestamp,
                         )
+
+                        log_file.flush()
 
                     # Remember the current zone state
                     previous_zone_states[track_id] = inside_zone
@@ -383,18 +464,17 @@ try:
             break
 
 finally:
-    # Release resources even if an error occurs
     cap.release()
     cv2.destroyAllWindows()
+    log_file.close()
 
 # ---------------- FINAL REPORT ----------------
 
 print("\nVideo processing finished.")
-print("Total entered:", entered_count)
-print("Total exited:", exited_count)
+print("Total line entries:", entered_count)
+print("Total line exits:", exited_count)
 print("Restricted-zone entries:", zone_entry_events)
 print("Restricted-zone exits:", zone_exit_events)
 print("Unique people IDs alerted:", len(intrusion_ids_seen))
-
-
+print(f"Event log saved to: {LOG_PATH}")
 
