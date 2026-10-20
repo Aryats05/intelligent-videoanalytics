@@ -1,16 +1,20 @@
 
 from pathlib import Path
-import csv
+from collections import deque
 from datetime import datetime
+import csv
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# ---------------- SETTINGS ----------------
+# ==================================================
+# 1. SETTINGS
+# ==================================================
 
 VIDEO_PATH = Path("videos/people.mp4")
 MODEL_NAME = "yolo11n.pt"
+LOG_PATH = Path("logs/intrusion_events.csv")
 
 CONFIDENCE = 0.3
 
@@ -18,7 +22,7 @@ CONFIDENCE = 0.3
 LINE_Y_RATIO = 0.60
 SAFETY_MARGIN = 15
 
-# Restricted zone: normalized coordinates (0.0 to 1.0)
+# Restricted-zone polygon (normalized coordinates)
 # Adjust these points to match your video.
 ZONE_POINTS = [
     (0.58, 0.20),
@@ -33,13 +37,15 @@ DISPLAY_HEIGHT = 540
 PLAYBACK_DELAY = 30
 MOVEMENT_THRESHOLD = 8
 
-# CSV event log
-LOG_PATH = Path("logs/intrusion_events.csv")
+# Dashboard settings
+MAX_RECENT_EVENTS = 5
 
-# ---------------- HELPER FUNCTIONS ----------------
+# ==================================================
+# 2. CSV AND EVENT FUNCTIONS
+# ==================================================
 
 def format_video_timestamp(milliseconds):
-    """Convert video position from milliseconds to HH:MM:SS.mmm."""
+    """Format a video timestamp as HH:MM:SS.mmm."""
     total_ms = max(0, int(milliseconds))
     hours = total_ms // 3_600_000
     minutes = (total_ms % 3_600_000) // 60_000
@@ -49,12 +55,22 @@ def format_video_timestamp(milliseconds):
     return f"{hours:02}:{minutes:02}:{seconds:02}.{millis:03}"
 
 
-def log_event(writer, person_id, event_type, video_timestamp):
-    """Write one intrusion event to the CSV log."""
+def log_event(writer, log_file, recent_events,
+              person_id, event_type, video_timestamp):
+    """Save an event to CSV and add it to the live dashboard."""
+
     recorded_at = datetime.now().astimezone().isoformat(
         timespec="seconds"
     )
 
+    event = {
+        "recorded_at": recorded_at,
+        "video_timestamp": video_timestamp,
+        "person_id": person_id,
+        "event_type": event_type,
+    }
+
+    # Save the event permanently in CSV
     writer.writerow([
         recorded_at,
         video_timestamp,
@@ -62,20 +78,44 @@ def log_event(writer, person_id, event_type, video_timestamp):
         event_type,
     ])
 
+    log_file.flush()
+
+    # Add the newest event to the front of the dashboard
+    recent_events.appendleft(event)
+
     print(
         f"{event_type}: Person ID {person_id} "
         f"at video time {video_timestamp}"
     )
 
 
-# ---------------- INITIALIZATION ----------------
+def draw_text(frame, text, position, color=(255, 255, 255),
+              scale=0.6, thickness=2):
+    """Draw readable text on the video frame."""
+    cv2.putText(
+        frame,
+        text,
+        position,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+# ==================================================
+# 3. INITIALIZATION
+# ==================================================
 
 if not VIDEO_PATH.exists():
-    raise FileNotFoundError(f"Video not found: {VIDEO_PATH}")
+    raise FileNotFoundError(
+        f"Video not found: {VIDEO_PATH}"
+    )
 
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# Append events so previous runs remain in the log.
+# Append mode preserves events from previous runs
 log_file = LOG_PATH.open(
     "a",
     newline="",
@@ -84,7 +124,7 @@ log_file = LOG_PATH.open(
 
 csv_writer = csv.writer(log_file)
 
-# Write the header only for a new or empty file.
+# Write column headers only when the file is empty
 if log_file.tell() == 0:
     csv_writer.writerow([
         "recorded_at",
@@ -94,39 +134,48 @@ if log_file.tell() == 0:
     ])
     log_file.flush()
 
-model = YOLO(MODEL_NAME)
-cap = cv2.VideoCapture(str(VIDEO_PATH))
+# Store only the five newest events in memory
+recent_events = deque(maxlen=MAX_RECENT_EVENTS)
 
-if not cap.isOpened():
-    log_file.close()
-    raise RuntimeError("Could not open the video.")
-
-# Previous person center positions
+# Person movement history
 previous_positions = {}
 
-# Previous stable sides of the counting line
+# Previous stable side of the counting line
 last_sides = {}
 
-# Previous restricted-zone state for each tracking ID
+# Previous restricted-zone state per tracking ID
 previous_zone_states = {}
 
-# Counts for the line
+# Line-crossing totals
 entered_count = 0
 exited_count = 0
 
-# Counts for restricted-zone transitions
+# Restricted-zone totals
 zone_entry_events = 0
 zone_exit_events = 0
 
-# Unique tracking IDs that entered the restricted zone
+# Distinct tracking IDs that entered the zone
 intrusion_ids_seen = set()
 
-print("Starting Intelligent Video Analytics...")
-print(f"CSV event log: {LOG_PATH}")
-
-# ---------------- VIDEO PROCESSING ----------------
+model = None
+cap = None
 
 try:
+    model = YOLO(MODEL_NAME)
+    cap = cv2.VideoCapture(str(VIDEO_PATH))
+
+    if not cap.isOpened():
+        raise RuntimeError(
+            f"Could not open video: {VIDEO_PATH}"
+        )
+
+    print("Starting Intelligent Video Analytics...")
+    print(f"CSV event log: {LOG_PATH}")
+
+    # ==================================================
+    # 4. VIDEO PROCESSING LOOP
+    # ==================================================
+
     while True:
         success, frame = cap.read()
 
@@ -136,12 +185,11 @@ try:
         height, width = frame.shape[:2]
         line_y = int(height * LINE_Y_RATIO)
 
-        # Get the video's current playback timestamp
         video_timestamp = format_video_timestamp(
             cap.get(cv2.CAP_PROP_POS_MSEC)
         )
 
-        # Convert normalized polygon coordinates to pixels
+        # Convert normalized polygon points to pixel coordinates
         zone = np.array(
             [
                 (int(x * width), int(y * height))
@@ -150,7 +198,9 @@ try:
             dtype=np.int32,
         )
 
-        # -------- DETECTION AND TRACKING --------
+        # ----------------------------------------------
+        # YOLO DETECTION + BYTETRACK TRACKING
+        # ----------------------------------------------
 
         results = model.track(
             frame,
@@ -161,7 +211,9 @@ try:
             verbose=False,
         )
 
-        # -------- DRAW RESTRICTED ZONE --------
+        # ----------------------------------------------
+        # DRAW RESTRICTED ZONE
+        # ----------------------------------------------
 
         overlay = frame.copy()
 
@@ -172,8 +224,10 @@ try:
         )
 
         frame = cv2.addWeighted(
-            overlay, 0.22,
-            frame, 0.78,
+            overlay,
+            0.22,
+            frame,
+            0.78,
             0,
         )
 
@@ -185,21 +239,21 @@ try:
             3,
         )
 
-        cv2.putText(
+        draw_text(
             frame,
             "RESTRICTED ZONE",
             (
                 max(10, int(zone[0][0])),
                 max(30, int(zone[0][1]) - 10),
             ),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
             (0, 0, 255),
+            0.7,
             2,
-            cv2.LINE_AA,
         )
 
-        # -------- DRAW COUNTING LINE --------
+        # ----------------------------------------------
+        # DRAW COUNTING LINE
+        # ----------------------------------------------
 
         cv2.line(
             frame,
@@ -225,10 +279,12 @@ try:
             1,
         )
 
-        # People currently inside the zone
+        # IDs inside the zone in this frame
         active_zone_ids = set()
 
-        # -------- PROCESS TRACKED PEOPLE --------
+        # ----------------------------------------------
+        # PROCESS DETECTED PEOPLE
+        # ----------------------------------------------
 
         if results and results[0].boxes is not None:
             boxes = results[0].boxes
@@ -237,17 +293,21 @@ try:
                 coordinates = boxes.xyxy.cpu().numpy()
                 track_ids = boxes.id.int().cpu().tolist()
 
-                for box, track_id in zip(coordinates, track_ids):
+                for box, track_id in zip(
+                    coordinates, track_ids
+                ):
                     x1, y1, x2, y2 = map(int, box)
 
                     center_x = (x1 + x2) // 2
                     center_y = (y1 + y2) // 2
 
-                    # Approximate foot position
+                    # Approximate foot point
                     foot_x = center_x
                     foot_y = y2
 
-                    # -------- MOVEMENT DIRECTION --------
+                    # ----------------------------------
+                    # MOVEMENT DIRECTION
+                    # ----------------------------------
 
                     previous_position = previous_positions.get(
                         track_id
@@ -269,13 +329,15 @@ try:
 
                         elif abs(dx) >= abs(dy):
                             direction = (
-                                "Moving Right" if dx > 0
+                                "Moving Right"
+                                if dx > 0
                                 else "Moving Left"
                             )
 
                         else:
                             direction = (
-                                "Moving Down" if dy > 0
+                                "Moving Down"
+                                if dy > 0
                                 else "Moving Up"
                             )
 
@@ -284,7 +346,9 @@ try:
                         center_y,
                     )
 
-                    # -------- RESTRICTED-ZONE DETECTION --------
+                    # ----------------------------------
+                    # RESTRICTED-ZONE EVENT DETECTION
+                    # ----------------------------------
 
                     inside_zone = cv2.pointPolygonTest(
                         zone,
@@ -296,66 +360,73 @@ try:
                         track_id, False
                     )
 
-                    # ENTRY EVENT
+                    # Outside -> inside: ENTRY
                     if inside_zone and not was_inside:
                         zone_entry_events += 1
                         intrusion_ids_seen.add(track_id)
 
                         log_event(
                             csv_writer,
+                            log_file,
+                            recent_events,
                             track_id,
                             "ENTRY",
                             video_timestamp,
                         )
 
-                        # Persist each event immediately
-                        log_file.flush()
-
-                    # EXIT EVENT
+                    # Inside -> outside: EXIT
                     elif was_inside and not inside_zone:
                         zone_exit_events += 1
 
                         log_event(
                             csv_writer,
+                            log_file,
+                            recent_events,
                             track_id,
                             "EXIT",
                             video_timestamp,
                         )
 
-                        log_file.flush()
-
-                    # Remember the current zone state
                     previous_zone_states[track_id] = inside_zone
 
                     if inside_zone:
                         active_zone_ids.add(track_id)
 
-                    # -------- LINE-CROSSING COUNTS --------
+                    # ----------------------------------
+                    # LINE-CROSSING COUNTS
+                    # ----------------------------------
 
                     if foot_y < line_y - SAFETY_MARGIN:
                         current_side = -1
-
                     elif foot_y > line_y + SAFETY_MARGIN:
                         current_side = 1
-
                     else:
                         current_side = None
 
                     previous_side = last_sides.get(track_id)
 
                     if current_side is not None:
-                        if previous_side == -1 and current_side == 1:
+                        if (
+                            previous_side == -1
+                            and current_side == 1
+                        ):
                             entered_count += 1
 
-                        elif previous_side == 1 and current_side == -1:
+                        elif (
+                            previous_side == 1
+                            and current_side == -1
+                        ):
                             exited_count += 1
 
                         last_sides[track_id] = current_side
 
-                    # -------- DRAW PERSON ANNOTATIONS --------
+                    # ----------------------------------
+                    # DRAW PERSON ANNOTATIONS
+                    # ----------------------------------
 
                     box_color = (
-                        (0, 0, 255) if inside_zone
+                        (0, 0, 255)
+                        if inside_zone
                         else (0, 255, 0)
                     )
 
@@ -375,80 +446,158 @@ try:
                         -1,
                     )
 
-                    cv2.putText(
+                    draw_text(
                         frame,
                         f"Person ID: {track_id}",
                         (x1, max(y1 - 40, 30)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
                         box_color,
+                        0.7,
                         2,
-                        cv2.LINE_AA,
                     )
 
-                    cv2.putText(
+                    draw_text(
                         frame,
                         direction,
                         (x1, max(y1 - 12, 55)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65,
                         (255, 255, 0),
+                        0.65,
                         2,
-                        cv2.LINE_AA,
                     )
 
                     if inside_zone:
-                        cv2.putText(
+                        draw_text(
                             frame,
                             "INTRUSION ALERT!",
                             (x1, min(y2 + 25, height - 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7,
                             (0, 0, 255),
+                            0.7,
                             2,
-                            cv2.LINE_AA,
                         )
 
-        # -------- DISPLAY COUNTERS --------
+        # ==================================================
+        # 5. LIVE EVENT DASHBOARD
+        # ==================================================
+
+        # Draw dashboard over the right side of the frame
+        panel_width = min(350, max(220, width - 20))
+        panel_left = max(10, width - panel_width - 10)
+        panel_top = 10
+        panel_height = 300
+
+        cv2.rectangle(
+            frame,
+            (panel_left, panel_top),
+            (
+                min(width - 1, panel_left + panel_width),
+                min(height - 1, panel_top + panel_height),
+            ),
+            (30, 30, 30),
+            -1,
+        )
+
+        text_x = panel_left + 12
+
+        draw_text(
+            frame,
+            "INTRUSION DASHBOARD",
+            (text_x, 38),
+            (255, 255, 255),
+            0.58,
+            2,
+        )
+
+        draw_text(
+            frame,
+            f"Zone entries: {zone_entry_events}",
+            (text_x, 75),
+            (0, 255, 0),
+            0.58,
+            2,
+        )
+
+        draw_text(
+            frame,
+            f"Zone exits: {zone_exit_events}",
+            (text_x, 108),
+            (0, 165, 255),
+            0.58,
+            2,
+        )
+
+        draw_text(
+            frame,
+            f"People inside: {len(active_zone_ids)}",
+            (text_x, 141),
+            (0, 0, 255),
+            0.58,
+            2,
+        )
+
+        draw_text(
+            frame,
+            f"Unique IDs: {len(intrusion_ids_seen)}",
+            (text_x, 174),
+            (255, 255, 255),
+            0.58,
+            2,
+        )
+
+        draw_text(
+            frame,
+            "RECENT EVENTS",
+            (text_x, 208),
+            (0, 255, 255),
+            0.55,
+            2,
+        )
+
+        for index, event in enumerate(recent_events):
+            y = 235 + index * 18
+
+            if y >= min(height - 5, panel_top + panel_height):
+                break
+
+            event_text = (
+                f"{event['event_type']} "
+                f"ID:{event['person_id']} "
+                f"{event['video_timestamp']}"
+            )
+
+            # Keep text within the panel on typical video sizes
+            max_chars = max(18, (panel_width - 20) // 8)
+            event_text = event_text[:max_chars]
+
+            draw_text(
+                frame,
+                event_text,
+                (text_x, y),
+                (255, 255, 255),
+                0.42,
+                1,
+            )
+
+        # ----------------------------------------------
+        # LEFT-SIDE COUNTERS
+        # ----------------------------------------------
 
         counters = [
             (f"Entered: {entered_count}", 40, (0, 255, 0)),
             (f"Exited: {exited_count}", 80, (0, 0, 255)),
-            (
-                f"People in zone: {len(active_zone_ids)}",
-                120,
-                (0, 0, 255),
-            ),
-            (
-                f"Unique IDs alerted: {len(intrusion_ids_seen)}",
-                160,
-                (0, 0, 255),
-            ),
-            (
-                f"Zone Entries: {zone_entry_events}",
-                200,
-                (0, 0, 255),
-            ),
-            (
-                f"Zone Exits: {zone_exit_events}",
-                240,
-                (0, 0, 255),
-            ),
         ]
 
         for label, y, color in counters:
-            cv2.putText(
+            draw_text(
                 frame,
                 label,
                 (20, y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
                 color,
+                0.8,
                 2,
-                cv2.LINE_AA,
             )
 
-        # -------- DISPLAY VIDEO --------
+        # ----------------------------------------------
+        # DISPLAY VIDEO
+        # ----------------------------------------------
 
         display_frame = cv2.resize(
             frame,
@@ -464,11 +613,15 @@ try:
             break
 
 finally:
-    cap.release()
+    if cap is not None:
+        cap.release()
+
     cv2.destroyAllWindows()
     log_file.close()
 
-# ---------------- FINAL REPORT ----------------
+# ==================================================
+# 6. FINAL REPORT
+# ==================================================
 
 print("\nVideo processing finished.")
 print("Total line entries:", entered_count)
@@ -477,4 +630,3 @@ print("Restricted-zone entries:", zone_entry_events)
 print("Restricted-zone exits:", zone_exit_events)
 print("Unique people IDs alerted:", len(intrusion_ids_seen))
 print(f"Event log saved to: {LOG_PATH}")
-
